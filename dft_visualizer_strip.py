@@ -1,39 +1,83 @@
 #!/usr/bin/env python3
+"""
+Lightweight matplotlib-based DFT audio visualization without GUI framework.
+Designed for rapid prototyping and headless analysis environments.
+"""
+
 import sys
 import wave
+from dataclasses import dataclass
+from typing import Optional
+
 import numpy as np
 import scipy.fftpack as fftpack
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
+
+@dataclass
+class AudioAnalysisConfig:
+    """Configuration for audio analysis parameters."""
+    window_size: int = 2048
+    hop_size: int = 512
+    onset_threshold: float = 0.15
+    min_frequency_hz: float = 20.0
+    max_peaks: int = 3
+    spectrum_xlim: int = 4000
+    spectrum_ylim: int = 50
+    db_floor: float = 40.0
+
+
 class NativeAudioSource:
+    """Direct WAV file parser supporting 8/16/32-bit PCM formats."""
+
+    DTYPE_MAP = {1: np.uint8, 2: np.int16, 4: np.int32}
+
     def __init__(self, filepath: str):
-        self.wf = wave.open(filepath, 'rb')
+        self.wf = wave.open(filepath, "rb")
         self.sample_rate = self.wf.getframerate()
         self.channels = self.wf.getnchannels()
         self.sampwidth = self.wf.getsampwidth()
         self.n_frames = self.wf.getnframes()
 
+        if self.sampwidth not in self.DTYPE_MAP:
+            raise ValueError(
+                f"Unsupported sample width: {self.sampwidth} bytes"
+            )
+
     def read_all(self) -> np.ndarray:
+        """Load entire WAV file and normalize to [-1.0, 1.0]."""
         raw_bytes = self.wf.readframes(self.n_frames)
-        if self.sampwidth == 2:
-            data = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        elif self.sampwidth == 1:
-            data = (np.frombuffer(raw_bytes, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+        dtype = self.DTYPE_MAP[self.sampwidth]
+
+        data = np.frombuffer(raw_bytes, dtype=dtype).astype(np.float32)
+
+        # Normalize based on sample width
+        if self.sampwidth == 1:
+            data = (data - 128.0) / 128.0
+        elif self.sampwidth == 2:
+            data = data / 32768.0
         elif self.sampwidth == 4:
-            data = np.frombuffer(raw_bytes, dtype=np.int32).astype(np.float32) / 2147483648.0
-        else:
-            raise ValueError(f"Unsupported wave bit-depth width: {self.sampwidth}")
-            
+            data = data / 2147483648.0
+
+        # Stereo downmix
         if self.channels > 1:
             data = data.reshape(-1, self.channels)
             data = np.mean(data, axis=1)
+
         return data
 
-    def close(self):
+    def close(self) -> None:
+        """Release file handle."""
         self.wf.close()
 
-def render_wav_animation(filepath: str, window_size: int = 2048, hop_size: int = 512, onset_threshold: float = 0.15):
+
+def render_wav_animation(
+    filepath: str, config: Optional[AudioAnalysisConfig] = None
+) -> None:
+    """Animate real-time DFT analysis of WAV file."""
+    config = config or AudioAnalysisConfig()
+
     try:
         source = NativeAudioSource(filepath)
         fs = source.sample_rate
@@ -43,97 +87,117 @@ def render_wav_animation(filepath: str, window_size: int = 2048, hop_size: int =
         print(f"Error loading WAV file '{filepath}': {e}")
         return
 
-    # Setup the figure and axes
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7))
-    
-    # Initialize empty line plots for the animation
-    line1, = ax1.plot([], [], color='g')
-    line2, = ax2.plot([], [], color='c')
-    
-    # Setup plot limits and static labels
-    ax1.set_title("Time Domain Oscilloscope")
-    ax1.set_ylim(-1.0, 1.0)
-    ax1.set_xlim(0, window_size)
-    ax1.grid(True, alpha=0.3)
+    # Validate analysis window
+    if config.window_size > len(full_signal):
+        print(f"Window size {config.window_size} exceeds signal length")
+        return
 
-    ax2.set_title("DFT Spectrum Magnitude Analysis")
-    ax2.set_xlim(0, 4000)  
-    ax2.set_ylim(0, 50)
-    ax2.set_xlabel("Frequency (Hz)")
-    ax2.set_ylabel("Magnitude (dB)")
-    ax2.grid(True, alpha=0.3)
+    fig, (ax_time, ax_freq) = plt.subplots(2, 1, figsize=(10, 7))
 
-    # Pre-calculate frequencies for the X-axis of the DFT
-    freqs = np.fft.fftfreq(window_size, 1.0 / fs)[:window_size // 2]
-    hann_window = np.hanning(window_size)
+    line_time, = ax_time.plot([], [], color="g", linewidth=0.5)
+    line_freq, = ax_freq.plot([], [], color="c", linewidth=1)
 
-    # Persistent list for annotations so we can clear them each frame
+    ax_time.set_title("Time Domain Oscilloscope")
+    ax_time.set_ylim(-1.0, 1.0)
+    ax_time.set_xlim(0, config.window_size)
+    ax_time.grid(True, alpha=0.3)
+
+    ax_freq.set_title("DFT Spectrum Magnitude Analysis")
+    ax_freq.set_xlim(0, config.spectrum_xlim)
+    ax_freq.set_ylim(0, config.spectrum_ylim)
+    ax_freq.set_xlabel("Frequency (Hz)")
+    ax_freq.set_ylabel("Magnitude (dB)")
+    ax_freq.grid(True, alpha=0.3)
+
+    # Pre-compute constants
+    freqs = np.fft.fftfreq(config.window_size, 1.0 / fs)[
+        : config.window_size // 2
+    ]
+    hann_window = np.hanning(config.window_size)
+    frame_interval_ms = (config.hop_size / fs) * 1000
+    num_frames = (len(full_signal) - config.window_size) // config.hop_size
+
     annotations = []
+    threshold_value = config.onset_threshold * 50.0
 
-    # Frame generator function based on hop_size
-    num_frames = (len(full_signal) - window_size) // hop_size
-    
-    def update(frame):
-        # Clear previous frame's peak annotations
-        while annotations:
-            annotations.pop().remove()
-            
-        start_idx = frame * hop_size
-        end_idx = start_idx + window_size
+    def update(frame_idx: int) -> list:
+        """Update plots for current frame."""
+        # Clear previous annotations
+        for anno in annotations:
+            anno.remove()
+        annotations.clear()
+
+        # Extract frame
+        start_idx = frame_idx * config.hop_size
+        end_idx = start_idx + config.window_size
         chunk = full_signal[start_idx:end_idx]
-        
-        # Calculate current timestamp in seconds
-        current_time_sec = start_idx / fs
-        fig.suptitle(f"DFT Audio Analysis: {filepath} | Time: {current_time_sec:.2f}s", fontsize=14)
 
-        # 1. Time Domain Update
-        line1.set_data(np.arange(window_size), chunk)
+        current_time = start_idx / fs
+        fig.suptitle(
+            f"DFT Analysis: {filepath} | Time: {current_time:.2f}s",
+            fontsize=12,
+        )
 
-        # 2. Frequency Domain Update
-        windowed_signal = chunk * hann_window
-        fft_complex = fftpack.fft(windowed_signal)
-        fft_mag = np.abs(fft_complex[:window_size // 2]) / (window_size / 2)
-        fft_mag_db = 20 * np.log10(fft_mag + 1e-5) + 40 
-        
-        line2.set_data(freqs, fft_mag_db)
+        # Time domain
+        line_time.set_data(np.arange(config.window_size), chunk)
 
-        # 3. Dynamic Peak Detection & Annotation
-        peak_count = 0
+        # Frequency domain
+        windowed = chunk * hann_window
+        fft_complex = fftpack.fft(windowed)
+        fft_mag = np.abs(fft_complex[: config.window_size // 2]) / (
+            config.window_size / 2
+        )
+        fft_mag_db = 20 * np.log10(fft_mag + 1e-5) + config.db_floor
+
+        line_freq.set_data(freqs, fft_mag_db)
+
+        # Peak detection
+        peak_indices = []
         for i in range(1, len(fft_mag_db) - 1):
-            if peak_count >= 3:
-                break
-            if fft_mag_db[i] > fft_mag_db[i-1] and fft_mag_db[i] > fft_mag_db[i+1]:
-                if fft_mag_db[i] > (onset_threshold * 50.0):
-                    freq_hz = freqs[i]
-                    mag_val = fft_mag_db[i]
-                    if freq_hz < 20.0:
-                        continue
-                    
-                    anno = ax2.annotate(f"{freq_hz:.0f} Hz", 
-                                 xy=(freq_hz, mag_val), 
-                                 xytext=(freq_hz, mag_val + 3),
-                                 arrowprops=dict(arrowstyle="->", color='y'),
-                                 color='y', 
-                                 horizontalalignment='center')
-                    annotations.append(anno)
-                    peak_count += 1
+            if (
+                fft_mag_db[i] > fft_mag_db[i - 1]
+                and fft_mag_db[i] > fft_mag_db[i + 1]
+                and fft_mag_db[i] > threshold_value
+                and freqs[i] >= config.min_frequency_hz
+            ):
+                peak_indices.append(i)
 
-        return [line1, line2] + annotations
+        # Keep highest peaks
+        peak_indices.sort(
+            key=lambda i: fft_mag_db[i], reverse=True
+        )[: config.max_peaks]
 
-    # Calculate interval to approximate real-time playback speed
-    frame_interval_ms = (hop_size / fs) * 1000
+        for idx in peak_indices:
+            freq = freqs[idx]
+            mag = fft_mag_db[idx]
+            anno = ax_freq.annotate(
+                f"{freq:.0f} Hz",
+                xy=(freq, mag),
+                xytext=(freq, mag + 3),
+                arrowprops=dict(arrowstyle="->", color="y"),
+                color="y",
+                ha="center",
+            )
+            annotations.append(anno)
+
+        return [line_time, line_freq] + annotations
 
     ani = FuncAnimation(
-        fig, 
-        update, 
-        frames=num_frames, 
-        interval=frame_interval_ms, 
+        fig,
+        update,
+        frames=num_frames,
+        interval=frame_interval_ms,
         blit=True,
-        repeat=False
+        repeat=False,
     )
-    
+
     plt.tight_layout()
     plt.show()
 
-# To run it, replace the execution call in your framework file with:
-# dft_visualizer_strip.render_wav_animation("LOOPsTwo.wav")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python dft_visualizer_strip.py <wav_file>")
+        sys.exit(1)
+
+    render_wav_animation(sys.argv[1])
