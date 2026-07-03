@@ -1,101 +1,140 @@
 #!/usr/bin/env python3
 """
 File Name: dft_visualizer.py
-Version: 3.3-PRODUCTION (10/10 Optimized)
+Version: 4.0-REFACTORED
 
-An enterprise-grade, real-time DFT Audio Visualizer featuring O(1) circular 
-buffering, thread-safe asynchronous queueing, adaptive micro-sleep pacing, 
-and memory-leak-safe PyQtGraph interface rendering.
+Enterprise-grade real-time DFT audio visualizer with O(1) circular buffering,
+thread-safe async queueing, and memory-efficient PyQtGraph rendering.
 """
 
 import sys
 import time
 import queue
-import json
+from dataclasses import dataclass
+from typing import Optional
+
 import numpy as np
 import scipy.fftpack as fftpack
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore, QtWidgets
 import pyqtgraph as pg
 import sounddevice as sd
 import soundfile as sf
 
-# ==========================================
-# 1. CORE DATA STRUCTS & AUDIO PIPELINES
-# ==========================================
+
+@dataclass
+class AudioConfig:
+    """Audio processing configuration parameters."""
+    sample_rate: int = 44100
+    window_size: int = 2048
+    buffer_size: int = 8192
+    block_size: int = 1024
+    frame_interval_ms: int = 16
+    max_sleep_ms: float = 5.0
+
+
+@dataclass
+class VisualizerConfig:
+    """Visualizer UI configuration parameters."""
+    waveform_range: tuple = (-1.0, 1.0)
+    spectrum_range: tuple = (0, 50)
+    db_floor: float = 40.0
+    min_frequency_hz: float = 20.0
+    max_peaks_displayed: int = 3
+    onset_threshold_default: float = 0.15
+
 
 class CircularAudioBuffer:
-    """
-    An O(1) complexity circular buffer replacing inefficient np.roll operations.
-    Maintains a continuous window of historical audio data without memory copies.
-    """
-    def __init__(self, size: int, dtype=np.float32):
+    """O(1) circular buffer with chronological ordering capability."""
+
+    def __init__(self, size: int, dtype: np.dtype = np.float32):
         self.size = size
         self.buffer = np.zeros(size, dtype=dtype)
-        self.index = 0
+        self.write_index = 0
 
-    def extend(self, data: np.ndarray):
-        """Appends new data to the buffer by updating a moving write pointer."""
-        n = len(data)
-        if n == 0:
+    def extend(self, data: np.ndarray) -> None:
+        """Append new data using circular pointer arithmetic."""
+        if len(data) == 0:
             return
+
+        if len(data) >= self.size:
+            self.buffer[:] = data[-self.size :]
+            self.write_index = 0
+            return
+
+        remaining_space = self.size - self.write_index
         
-        if n >= self.size:
-            self.buffer[:] = data[-self.size:]
-            self.index = 0
-            return
-
-        end_space = self.size - self.index
-        if n <= end_space:
-            self.buffer[self.index:self.index + n] = data
-            self.index = (self.index + n) % self.size
+        if len(data) <= remaining_space:
+            self.buffer[self.write_index : self.write_index + len(data)] = data
+            self.write_index = (self.write_index + len(data)) % self.size
         else:
-            self.buffer[self.index:] = data[:end_space]
-            self.buffer[:n - end_space] = data[end_space:]
-            self.index = n - end_space
+            self.buffer[self.write_index :] = data[:remaining_space]
+            self.buffer[: len(data) - remaining_space] = data[remaining_space:]
+            self.write_index = len(data) - remaining_space
 
     def get_ordered_window(self) -> np.ndarray:
-        """Returns the data in chronologically correct linear order."""
-        if self.index == 0:
+        """Return buffer contents in chronological order."""
+        if self.write_index == 0:
             return self.buffer.copy()
-        return np.concatenate((self.buffer[self.index:], self.buffer[:self.index]))
+        return np.concatenate(
+            (self.buffer[self.write_index :], self.buffer[: self.write_index])
+        )
 
 
 class LiveAudioSource:
-    """
-    Thread-safe, queue-based live audio ingestion pipeline.
-    Standardizes empty block signatures and exposes configurable buffer limits.
-    """
-    def __init__(self, max_queue_size: int = 500):
-        self.audio_queue = queue.Queue(maxsize=max_queue_size)
-        self.empty_signature = np.zeros(0, dtype=np.float32)
+    """Thread-safe queue-based live audio ingestion."""
 
-    def callback(self, indata, frames, time_info, status):
-        """System audio callback thread writing directly to the pipeline queue."""
+    def __init__(self, max_queue_size: int = 500):
+        self.audio_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
+        self.sample_rate: int = 44100
+        self.is_active: bool = False
+
+    def callback(
+        self, indata: np.ndarray, frames: int, time_info, status
+    ) -> None:
+        """System audio callback routing samples to queue."""
         if status:
-            pass
+            return
+
         try:
-            data_block = indata[:, 0].copy() if indata.ndim > 1 else indata.copy()
-            self.audio_queue.put_nowait(data_block)
+            data = indata[:, 0].copy() if indata.ndim > 1 else indata.copy()
+            self.audio_queue.put_nowait(data)
         except queue.Full:
             try:
                 self.audio_queue.get_nowait()
-                self.audio_queue.put_nowait(data_block)
+                self.audio_queue.put_nowait(data)
             except (queue.Empty, queue.Full):
                 pass
 
     def read(self) -> np.ndarray:
-        """Reads latest block. Returns standardized empty signature on starvation."""
+        """Read next audio block or return empty array."""
         try:
             return self.audio_queue.get_nowait()
         except queue.Empty:
-            return self.empty_signature
+            return np.array([], dtype=np.float32)
+
+    def start_capture(self, sample_rate: int) -> None:
+        """Initialize hardware audio stream."""
+        self.sample_rate = sample_rate
+        self.stream = sd.InputStream(
+            samplerate=sample_rate,
+            channels=1,
+            blocksize=1024,
+            callback=self.callback,
+        )
+        self.stream.start()
+        self.is_active = True
+
+    def stop_capture(self) -> None:
+        """Safely close hardware audio stream."""
+        if hasattr(self, "stream"):
+            self.stream.stop()
+            self.stream.close()
+            self.is_active = False
 
 
 class FileAudioSource:
-    """
-    Time-synchronized file playback processing module.
-    Leverages adaptive micro-sleeping and unified empty block boundaries.
-    """
+    """Time-synchronized file playback with adaptive micro-sleeping."""
+
     def __init__(self, filepath: str, block_size: int = 1024, max_sleep_ms: float = 5.0):
         self.file = sf.SoundFile(filepath)
         self.block_size = block_size
@@ -103,12 +142,11 @@ class FileAudioSource:
         self.sample_rate = self.file.samplerate
         self.start_time = time.perf_counter()
         self.frames_read = 0
-        self.empty_signature = np.zeros(0, dtype=np.float32)
 
     def read(self) -> np.ndarray:
-        """Reads time-synced blocks using micro-sleeping to mitigate visual stuttering."""
+        """Read time-synced block with micro-sleep pacing."""
         if self.frames_read >= self.file.frames:
-            return self.empty_signature
+            return np.array([], dtype=np.float32)
 
         expected_elapsed = self.frames_read / self.sample_rate
         actual_elapsed = time.perf_counter() - self.start_time
@@ -116,11 +154,11 @@ class FileAudioSource:
         if expected_elapsed > actual_elapsed:
             sleep_time = min(expected_elapsed - actual_elapsed, self.max_sleep_sec)
             time.sleep(sleep_time)
-            return self.empty_signature
+            return np.array([], dtype=np.float32)
 
-        data = self.file.read(self.block_size, dtype='float32')
+        data = self.file.read(self.block_size, dtype="float32")
         if len(data) == 0:
-            return self.empty_signature
+            return np.array([], dtype=np.float32)
 
         if data.ndim > 1:
             data = np.mean(data, axis=1)
@@ -128,193 +166,185 @@ class FileAudioSource:
         self.frames_read += len(data)
         return data
 
-    def close(self):
-        """Safely tears down file streams to prevent system resource leaks."""
-        if hasattr(self, 'file') and self.file:
+    def close(self) -> None:
+        """Release file resources."""
+        if hasattr(self, "file") and self.file:
             self.file.close()
 
 
-# ==========================================
-# 2. APPLICATION USER INTERFACE (GUI)
-# ==========================================
-
 class DFTVisualizer(QtWidgets.QMainWindow):
-    def __init__(self, audio_filepath: str = None):
+    """Real-time audio DFT visualization with peak detection."""
+
+    def __init__(self, audio_config: AudioConfig = None, viz_config: VisualizerConfig = None, audio_filepath: Optional[str] = None):
         super().__init__()
-        self.setWindowTitle("DFT Audio Visualizer Framework v3.3")
+        
+        self.audio_config = audio_config or AudioConfig()
+        self.viz_config = viz_config or VisualizerConfig()
+        self.audio_filepath = audio_filepath
+        
+        self.setWindowTitle("DFT Audio Visualizer v4.0")
         self.resize(1024, 700)
 
-        # Configurable Parameters
-        self.fs = 44100
-        self.window_size = 2048
-        self.buffer_size = 8192
-        self.empty_sig = np.zeros(0, dtype=np.float32)
-        
-        # Instantiate O(1) Buffer Engine
-        self.audio_buffer = CircularAudioBuffer(self.buffer_size)
-        
-        # Source Selection
-        self.filepath = audio_filepath
-        self.audio_source = None
-        self.stream = None
-        
-        # Peak Detection States
-        self.peak_text_items = []
-        self.onset_threshold = 0.15
-        
-        self.init_ui()
-        self.init_audio()
-        
-        # Frame Processing Timer
-        self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self.update_framework)
-        self.timer.start(16)  # Target ~60 FPS
+        self.audio_buffer = CircularAudioBuffer(self.audio_config.buffer_size)
+        self.audio_source: Optional[LiveAudioSource | FileAudioSource] = None
+        self.peak_text_items: list = []
+        self.onset_threshold = self.viz_config.onset_threshold_default
 
-    def init_ui(self):
-        """Builds a scannable layout configuration hierarchy."""
+        self._init_ui()
+        self._init_audio()
+
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self._update_frame)
+        self.timer.start(self.audio_config.frame_interval_ms)
+
+    def _init_ui(self) -> None:
+        """Construct UI layout hierarchy."""
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QtWidgets.QVBoxLayout(central_widget)
-        
-        # Control Pane Header
+
+        # Control panel
         control_layout = QtWidgets.QHBoxLayout()
-        control_layout.addWidget(QtWidgets.QLabel("Onset Detection Sensitivity Threshold:"))
-        
+        control_layout.addWidget(QtWidgets.QLabel("Peak Sensitivity:"))
+
         self.threshold_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.threshold_slider.setMinimum(1)
         self.threshold_slider.setMaximum(100)
-        self.threshold_slider.setValue(15)
-        self.threshold_slider.valueChanged.connect(self.handle_threshold_change)
+        self.threshold_slider.setValue(
+            int(self.viz_config.onset_threshold_default * 100)
+        )
+        self.threshold_slider.valueChanged.connect(self._on_threshold_changed)
         control_layout.addWidget(self.threshold_slider)
         main_layout.addLayout(control_layout)
-        
-        # PyQtGraph Visualization Split Blocks
-        self.win = pg.GraphicsLayoutWidget()
-        main_layout.addWidget(self.win)
-        
-        # Waveform Subplot Plot
-        self.p1 = self.win.addPlot(title="Time Domain Oscilloscope Real-Time Signal")
-        self.p1.setYRange(-1.0, 1.0)
-        self.waveform_plot = self.p1.plot(pen='g')
-        
-        self.win.nextRow()
-        
-        # Frequency Subplot FFT Spectrum Plot
-        self.p2 = self.win.addPlot(title="Discrete Fourier Transform Spectrum Magnitude Analysis")
-        self.p2.setYRange(0, 50)
-        self.fft_plot = self.p2.plot(pen='c')
 
-    def init_audio(self):
-        """Binds correct execution pipeline depending on inputs."""
-        if self.filepath:
+        # PyQtGraph plots
+        self.graphics_view = pg.GraphicsLayoutWidget()
+        main_layout.addWidget(self.graphics_view)
+
+        self.waveform_plot_view = self.graphics_view.addPlot(
+            title="Time Domain Oscilloscope"
+        )
+        self.waveform_plot_view.setYRange(*self.viz_config.waveform_range)
+        self.waveform_curve = self.waveform_plot_view.plot(pen="g")
+
+        self.graphics_view.nextRow()
+
+        self.spectrum_plot_view = self.graphics_view.addPlot(
+            title="DFT Spectrum Magnitude"
+        )
+        self.spectrum_plot_view.setYRange(*self.viz_config.spectrum_range)
+        self.spectrum_curve = self.spectrum_plot_view.plot(pen="c")
+
+    def _init_audio(self) -> None:
+        """Initialize audio source (file or live)."""
+        if self.audio_filepath:
             try:
-                self.audio_source = FileAudioSource(self.filepath, block_size=1024)
-                self.fs = self.audio_source.sample_rate
+                self.audio_source = FileAudioSource(
+                    self.audio_filepath,
+                    block_size=self.audio_config.block_size,
+                    max_sleep_ms=self.audio_config.max_sleep_ms,
+                )
+                self.audio_config.sample_rate = self.audio_source.sample_rate
+                return
             except Exception as e:
-                print(f"File open failure: {e}. Falling back to live mic capture input.")
-                self.filepath = None
+                print(f"File load error: {e}. Falling back to microphone.")
 
-        if not self.filepath:
-            self.audio_source = LiveAudioSource()
-            self.stream = sd.InputStream(
-                samplerate=self.fs,
-                channels=1,
-                blocksize=1024,
-                callback=self.audio_source.callback
-            )
-            self.stream.start()
+        self.audio_source = LiveAudioSource()
+        self.audio_source.start_capture(self.audio_config.sample_rate)
 
-    def handle_threshold_change(self, val):
-        self.onset_threshold = val / 100.0
+    def _on_threshold_changed(self, value: int) -> None:
+        """Update onset threshold from slider."""
+        self.onset_threshold = value / 100.0
 
-    def clear_peak_labels(self):
-        """Thread-safe removal of text graphics to mitigate cumulative memory leaks."""
+    def _clear_peak_annotations(self) -> None:
+        """Remove all peak text items from plot."""
         for item in self.peak_text_items:
             try:
-                self.p2.removeItem(item)
+                self.spectrum_plot_view.removeItem(item)
             except Exception:
                 pass
         self.peak_text_items.clear()
 
-    def update_framework(self):
-        """Primary compute frame loop processing real-time pipelines sequentially."""
-        raw_block = self.audio_source.read()
+    def _detect_peaks(self, magnitude_db: np.ndarray, frequencies: np.ndarray) -> None:
+        """Detect and annotate local maxima in spectrum."""
+        self._clear_peak_annotations()
         
-        # Gracefully swallow standard empty responses without killing loop cadence
-        if raw_block.shape == self.empty_sig.shape:
+        threshold_value = self.onset_threshold * 50.0
+        peak_indices = []
+
+        for i in range(1, len(magnitude_db) - 1):
+            if (
+                magnitude_db[i] > magnitude_db[i - 1]
+                and magnitude_db[i] > magnitude_db[i + 1]
+                and magnitude_db[i] > threshold_value
+                and frequencies[i] >= self.viz_config.min_frequency_hz
+            ):
+                peak_indices.append(i)
+
+        # Keep highest peaks
+        peak_indices.sort(
+            key=lambda i: magnitude_db[i], reverse=True
+        )[: self.viz_config.max_peaks_displayed]
+
+        for idx in peak_indices:
+            freq = frequencies[idx]
+            mag = magnitude_db[idx]
+            text_item = pg.TextItem(
+                text=f"{freq:.0f} Hz", color="y", anchor=(0.5, 1)
+            )
+            self.spectrum_plot_view.addItem(text_item)
+            text_item.setPos(freq, mag + 2)
+            self.peak_text_items.append(text_item)
+
+    def _update_frame(self) -> None:
+        """Main processing loop for frame updates."""
+        raw_block = self.audio_source.read()
+
+        if len(raw_block) == 0:
             return
 
-        # Extend historical matrix window natively via efficient circular pointer
         self.audio_buffer.extend(raw_block)
         ordered_data = self.audio_buffer.get_ordered_window()
 
-        # 1. Update Graphical Oscilloscope Curve View
-        display_wave = ordered_data[-self.window_size:]
-        self.waveform_plot.setData(display_wave)
+        # Time domain display
+        display_window = ordered_data[-self.audio_config.window_size :]
+        self.waveform_curve.setData(display_window)
 
-        # 2. Apply Hann Windowing Functions to Guard Against Spectral Splitting
-        hann_window = np.hanning(len(display_wave))
-        windowed_signal = display_wave * hann_window
+        # Frequency domain analysis
+        hann_window = np.hanning(len(display_window))
+        windowed_signal = display_window * hann_window
 
-        # 3. Process Discrete Fourier Transform Arrays via Fast Fourier Transforms
         fft_complex = fftpack.fft(windowed_signal)
-        fft_mag = np.abs(fft_complex[:self.window_size // 2]) / (self.window_size / 2)
-        fft_mag_db = 20 * np.log10(fft_mag + 1e-5) + 40  # Scaled positive floor bounds
+        fft_mag = np.abs(fft_complex[: self.audio_config.window_size // 2]) / (
+            self.audio_config.window_size / 2
+        )
+        fft_mag_db = (
+            20 * np.log10(fft_mag + 1e-5) + self.viz_config.db_floor
+        )
 
-        freqs = np.fft.fftfreq(self.window_size, 1.0 / self.fs)[:self.window_size // 2]
-        self.fft_plot.setData(freqs, fft_mag_db)
+        frequencies = np.fft.fftfreq(
+            self.audio_config.window_size, 1.0 / self.audio_config.sample_rate
+        )[: self.audio_config.window_size // 2]
 
-        # 4. Deterministic Peak Analysis
-        self.clear_peak_labels()
-        peak_count = 0
-        
-        for i in range(1, len(fft_mag_db) - 1):
-            if peak_count >= 3:
-                break
-                
-            # Detect peaks exceeding surrounding localized samples and active slider bounds
-            if fft_mag_db[i] > fft_mag_db[i-1] and fft_mag_db[i] > fft_mag_db[i+1]:
-                if fft_mag_db[i] > (self.onset_threshold * 50.0):
-                    freq_hz = freqs[i]
-                    mag_val = fft_mag_db[i]
+        self.spectrum_curve.setData(frequencies, fft_mag_db)
+        self._detect_peaks(fft_mag_db, frequencies)
 
-                    # Use structural continue statement to pass empty zones cleanly without loops stalling
-                    if freq_hz < 20.0:
-                        continue
-
-                    # Instantiate and draw text graphic allocations dynamically
-                    txt = pg.TextItem(text=f"{freq_hz:.0f} Hz", color='y', anchor=(0.5, 1))
-                    self.p2.addItem(txt)
-                    txt.setPos(freq_hz, mag_val + 2)
-                    self.peak_text_items.append(txt)
-                    peak_count += 1
-
-    def closeEvent(self, event):
-        """Enforces rigorous teardown on user close to block application crashes."""
+    def closeEvent(self, event) -> None:
+        """Cleanup on window close."""
         self.timer.stop()
-        if self.stream is not None:
-            self.stream.stop()
-            self.stream.close()
-        if hasattr(self.audio_source, 'close'):
+        if isinstance(self.audio_source, LiveAudioSource):
+            self.audio_source.stop_capture()
+        elif isinstance(self.audio_source, FileAudioSource):
             self.audio_source.close()
-        self.clear_peak_labels()
+        self._clear_peak_annotations()
         event.accept()
 
 
-# ==========================================
-# 3. RUNTIME INITIALIZATION TARGET ENTRY
-# ==========================================
-
 if __name__ == "__main__":
-    # If a file path is provided as an argument, use file mode; otherwise use microphone
-    target_file = sys.argv[1] if len(sys.argv) > 1 else None
-    
+    filepath = sys.argv[1] if len(sys.argv) > 1 else None
+
     app = QtWidgets.QApplication(sys.argv)
-    visualizer = DFTVisualizer(audio_filepath=target_file)
+    visualizer = DFTVisualizer(audio_filepath=filepath)
     visualizer.show()
-    
-    # Dual toolkit cross-framework compatibility check
-    if hasattr(app, 'exec'):
-        sys.exit(app.exec())
-    else:
-        sys.exit(app.exec_())
+
+    sys.exit(app.exec_() if hasattr(app, "exec_") else app.exec())
